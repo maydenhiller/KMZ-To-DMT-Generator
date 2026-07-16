@@ -1,6 +1,5 @@
-# KMZ To DMT Generator  --  single-file Streamlit app.
-# Upload a KMZ from the XLSX-To-KMZ Generator; download a DeLorme Street Atlas
-# .dmt with four layers: AGMs, Access, Centerline, Notes.
+# KMZ To DMT Generator - single-file Streamlit app
+# Upload a KMZ, download a DeLorme Street Atlas .dmt (AGMs, Access, Centerline, Notes)
 
 import os
 import re
@@ -1237,18 +1236,13 @@ def generate_dmt(kmz_path_or_bytes):
         tdata = streams[stream_name]
         if folder_name in ('AGMs', 'Notes'):
             pts = [p for p in items if p.kind == 'point']
-            if not pts:
-                continue
+            # Always rebuild the layer (empty if the KMZ has none) so the
+            # template's own sample objects never leak into the output.
             t = PointLayerTemplate(tdata, has_symbol=(folder_name == 'AGMs'))
-            if folder_name == 'AGMs':
-                resolver = make_agm_sig_resolver(t)
-            else:
-                resolver = None
+            resolver = make_agm_sig_resolver(t) if folder_name == 'AGMs' else None
             new_streams[stream_name] = t.build(pts, resolver)
         else:
             lns = [p for p in items if p.kind == 'line']
-            if not lns:
-                continue
             t = LineLayerTemplate(tdata)
 
             def color_fn(pm, fld=folder_name):
