@@ -4,6 +4,7 @@
 import os
 import re
 import time
+import math
 import base64
 import zipfile
 import struct
@@ -1333,7 +1334,43 @@ def generate_dmt(kmz_path_or_bytes):
     layer_names = [rename[o] for o in order]
     new_streams['Annotate.Filenames'] = _filenames_stream('AGMs', layer_names)
     new_streams['Annotate.ActiveFilenames'] = _active_stream('AGMs')
+
+    # Center the initial map view on the AGMs (fall back to any geometry).
+    pts = [p for p in folders.get('AGMs', []) if p.kind == 'point']
+    coords = [c for p in pts for c in p.coords]
+    if not coords:
+        coords = [c for items in folders.values() for p in items for c in p.coords]
+    if coords:
+        ms = _map_state(streams['Map2DState'], coords)
+        new_streams['Map2DState'] = ms
+        new_streams['Map2DState2'] = ms
+
     return write_ole(tpl, new_streams, rename=rename)
+
+
+def _map_state(template, coords):
+    lons = [c[0] for c in coords]
+    lats = [c[1] for c in coords]
+    clon = (min(lons) + max(lons)) / 2.0
+    clat = (min(lats) + max(lats)) / 2.0
+    span = max(max(lons) - min(lons), max(lats) - min(lats), 1e-4)
+    # Calibrated from known DeLorme workspaces; 0.4 margin biases slightly wide
+    # so no AGM sits off-screen.  effective zoom = level + log2(fine-multiplier).
+    eff = 6.64 - 1.53 * math.log2(span) - 0.4
+    eff = max(2.0, min(15.0, eff))
+    level = int(math.floor(eff))
+    mult = 2.0 ** (eff - level)              # in [1, 2)
+    X, Y = enc(clon, clat)
+    out = bytearray(template)
+    struct.pack_into('<I', out, 4, X)
+    struct.pack_into('<I', out, 8, Y)
+    struct.pack_into('<I', out, 12, level & 0xFFFFFFFF)
+    struct.pack_into('<d', out, 16, mult)
+    struct.pack_into('<d', out, 24, 1.0)
+    out[39] = 0x80 if mult > 1.0000001 else 0x00
+    struct.pack_into('<I', out, 45, X)
+    struct.pack_into('<I', out, 49, Y)
+    return bytes(out)
 
 
 DRAW_DIR = r'C:\DeLorme Docs\Draw'
