@@ -318,6 +318,31 @@ def write_ole(template, new_streams, rename=None, sect_size=512, mini_size=64, m
 KNS = {'k': 'http://www.opengis.net/kml/2.2'}
 
 
+_KNOWN_NS = {
+    'xsi': 'http://www.w3.org/2001/XMLSchema-instance',
+    'xsd': 'http://www.w3.org/2001/XMLSchema',
+    'fo': 'http://www.w3.org/1999/XSL/Format',
+    'msxsl': 'urn:schemas-microsoft-com:xslt',
+}
+
+
+def _repair_namespaces(xml_text):
+    declared = set(re.findall(r'xmlns:([A-Za-z0-9_.\-]+)\s*=', xml_text))
+    used = set(re.findall(r'</?([A-Za-z][A-Za-z0-9_.\-]*):', xml_text))
+    used |= set(re.findall(r'\s([A-Za-z][A-Za-z0-9_.\-]*):[A-Za-z][A-Za-z0-9_.\-]*\s*=\s*["\']', xml_text))
+    missing = used - declared - {'xml', 'xmlns'}
+    if not missing:
+        return xml_text
+    decls = ''.join(' xmlns:%s="%s"' % (p, _KNOWN_NS.get(p, 'urn:x-prefix:' + p))
+                    for p in sorted(missing))
+    m = re.search(r'<kml\b[^>]*', xml_text)
+    if not m:
+        m = re.search(r'<[A-Za-z][A-Za-z0-9_.\-]*\b[^>]*', xml_text)
+    if m:
+        return xml_text[:m.end()] + decls + xml_text[m.end():]
+    return xml_text
+
+
 def _ln(el):
     return el.tag.split('}')[-1]
 
@@ -337,12 +362,13 @@ def _coords(s):
 
 
 class Placemark:
-    def __init__(self, name, kind, coords, icon=None, color=None):
+    def __init__(self, name, kind, coords, icon=None, color=None, group=None):
         self.name = name or ''
         self.kind = kind          # 'point' or 'line'
         self.coords = coords      # list of (lon, lat)
         self.icon = icon          # e.g. 'flag.png'
         self.color = color        # KML aabbggrr hex string
+        self.group = group        # 'public' / 'private' / None (from ancestor folder)
 
 
 def _read_kml_bytes(path_or_bytes):
@@ -358,7 +384,11 @@ def _read_kml_bytes(path_or_bytes):
 
 def parse_kmz(path_or_bytes):
     raw = _read_kml_bytes(path_or_bytes)
-    root = ET.fromstring(raw)
+    text = raw.decode('utf-8', 'replace') if isinstance(raw, (bytes, bytearray)) else raw
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        root = ET.fromstring(_repair_namespaces(text))
 
     # style id -> (icon file, color)
     styles = {}
@@ -381,25 +411,49 @@ def parse_kmz(path_or_bytes):
         return (href.text.split('/')[-1] if href is not None and href.text else None,
                 color.text if color is not None else None)
 
+    # Map a container's name to one of the four canonical layers.  Handles the
+    # standard export (AGMs/Access/Centerline/Notes folders with direct
+    # placemarks) and third-party exports where a layer is a <Document>, uses a
+    # different case/spelling, or nests its placemarks in sub-folders.
+    CANON = {
+        'agms': 'AGMs', 'agm': 'AGMs',
+        'access': 'Access',
+        'centerline': 'Centerline', 'centreline': 'Centerline', 'center line': 'Centerline',
+        'notes': 'Notes', 'note': 'Notes', 'map notes': 'Notes',
+    }
     folders = {}
-
-    # Any Folder anywhere in the tree that directly holds placemarks is a layer.
-    for f in root.iter():
-        if _ln(f) != 'Folder':
+    for el in root.iter():
+        if _ln(el) not in ('Folder', 'Document'):
             continue
-        fname = _text(f, 'k:name') or 'Folder'
+        nm = _text(el, 'k:name')
+        if not nm:
+            continue
+        key = CANON.get(nm.strip().lower())
+        if not key or key in folders:
+            continue
         items = []
-        for pm in f.findall('k:Placemark', KNS):
-            nm = _text(pm, 'k:name')
-            icon, color = style_of(pm)
-            pt = pm.find('.//k:Point/k:coordinates', KNS)
-            ls = pm.find('.//k:LineString/k:coordinates', KNS)
-            if pt is not None and pt.text:
-                items.append(Placemark(nm, 'point', _coords(pt.text), icon, color))
-            elif ls is not None and ls.text:
-                items.append(Placemark(nm, 'line', _coords(ls.text), icon, color))
+        # Recurse through sub-folders, tracking a public/private group tag from
+        # ancestor folder names (used by the Corrpro access colour rule).
+        def walk(container, group):
+            for child in container:
+                t = _ln(child)
+                if t == 'Placemark':
+                    pname = _text(child, 'k:name')
+                    icon, color = style_of(child)
+                    pt = child.find('.//k:Point/k:coordinates', KNS)
+                    ls = child.find('.//k:LineString/k:coordinates', KNS)
+                    if pt is not None and pt.text:
+                        items.append(Placemark(pname, 'point', _coords(pt.text), icon, color, group))
+                    elif ls is not None and ls.text:
+                        items.append(Placemark(pname, 'line', _coords(ls.text), icon, color, group))
+                elif t in ('Folder', 'Document'):
+                    sub = _text(child, 'k:name') or ''
+                    low = sub.lower()
+                    g = 'public' if 'public' in low else 'private' if 'private' in low else group
+                    walk(child, g)
+        walk(el, None)
         if items:
-            folders[fname] = items
+            folders[key] = items
     return folders
 
 
@@ -1208,11 +1262,21 @@ def make_agm_sig_resolver(agm_template):
 
     def resolve(pm):
         icon = (pm.icon or '').lower()
+        # Standard export: pick the symbol from the KMZ icon.
         if 'triangle' in icon and tri is not None:
             return ('C', tri)
         if 'flag' in icon and flag is not None:
             return ('C', flag)
         if ('circle' in icon or 'blu' in icon or 'paddle' in icon or 'dot' in icon) and circle is not None:
+            return ('C', circle)
+        # Corrpro-style export (no symbol icon): pick by AGM name prefix --
+        # AGM* -> red flag, MLV* -> purple triangle, anything else -> blue dot.
+        name = (pm.name or '').strip().lower()
+        if name.startswith('agm') and flag is not None:
+            return ('C', flag)
+        if name.startswith('mlv') and tri is not None:
+            return ('C', tri)
+        if circle is not None:
             return ('C', circle)
         return agm_template.default_sig
     return resolve
@@ -1246,6 +1310,11 @@ def generate_dmt(kmz_path_or_bytes):
             t = LineLayerTemplate(tdata)
 
             def color_fn(pm, fld=folder_name):
+                # Corrpro access rule: public -> blue, private -> light blue.
+                if pm.group == 'public':
+                    return (0, 0, 255)
+                if pm.group == 'private':
+                    return (0, 176, 240)
                 rgb = kml_color_to_rgb(pm.color)
                 if rgb:
                     return rgb
