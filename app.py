@@ -402,11 +402,27 @@ def parse_kmz(path_or_bytes):
                 href.text.split('/')[-1] if href is not None and href.text else None,
                 color.text if color is not None else None,
             )
+    # StyleMap id -> its 'normal' style id (many exports reference points through
+    # a StyleMap normal/highlight pair rather than a Style directly).
+    stylemaps = {}
+    for sm in root.iter():
+        if _ln(sm) == 'StyleMap':
+            normal = None
+            for pair in sm.findall('k:Pair', KNS):
+                key = pair.find('k:key', KNS)
+                su = pair.find('k:styleUrl', KNS)
+                if key is not None and key.text == 'normal' and su is not None and su.text:
+                    normal = su.text.lstrip('#')
+            if normal:
+                stylemaps[sm.get('id')] = normal
 
     def style_of(pm):
         su = pm.find('k:styleUrl', KNS)
         if su is not None and su.text:
-            return styles.get(su.text.lstrip('#'), (None, None))
+            ref = su.text.lstrip('#')
+            ref = stylemaps.get(ref, ref)          # follow StyleMap -> normal
+            if ref in styles:
+                return styles[ref]
         href = pm.find('.//k:Icon/k:href', KNS)
         color = pm.find('.//k:color', KNS)
         return (href.text.split('/')[-1] if href is not None and href.text else None,
@@ -441,12 +457,16 @@ def parse_kmz(path_or_bytes):
                 if t == 'Placemark':
                     pname = _text(child, 'k:name')
                     icon, color = style_of(child)
-                    pt = child.find('.//k:Point/k:coordinates', KNS)
-                    ls = child.find('.//k:LineString/k:coordinates', KNS)
-                    if pt is not None and pt.text:
-                        items.append(Placemark(pname, 'point', _coords(pt.text), icon, color, group))
-                    elif ls is not None and ls.text:
-                        items.append(Placemark(pname, 'line', _coords(ls.text), icon, color, group))
+                    # A placemark may hold multiple geometries (MultiGeometry:
+                    # e.g. a Centerline line bundled with a label Point).  Emit
+                    # every LineString and Point so nothing is silently dropped;
+                    # the layer builder keeps only the kind it needs.
+                    for lsc in child.findall('.//k:LineString/k:coordinates', KNS):
+                        if lsc.text:
+                            items.append(Placemark(pname, 'line', _coords(lsc.text), icon, color, group))
+                    for ptc in child.findall('.//k:Point/k:coordinates', KNS):
+                        if ptc.text:
+                            items.append(Placemark(pname, 'point', _coords(ptc.text), icon, color, group))
                 elif t in ('Folder', 'Document'):
                     sub = _text(child, 'k:name') or ''
                     low = sub.lower()
@@ -1095,11 +1115,10 @@ class PointLayerTemplate:
             return False
         X = struct.unpack_from('<I', data, i)[0]
         Y = struct.unpack_from('<I', data, i + 4)[0]
-        if not (0x40000000 < X < 0x60000000 and 0x60000000 < Y < 0x70000000):
-            return False
         lon = (X - S31) / S23
         lat = (S31 - Y) / S23
-        return -180 < lon < 180 and -85 < lat < 85
+        # Whole US incl. Alaska/Hawaii/southern tip of Texas & Florida.
+        return -180 < lon < -60 and 15 < lat < 72
 
     def _bootstrap(self, data):
         i = 0
@@ -1426,7 +1445,6 @@ if uploaded is not None:
                 st.exception(e); st.stop()
         base = os.path.splitext(uploaded.name)[0]
         st.success("Done! Your .dmt is ready.")
-        st.download_button("Download .dmt", data=out, file_name="%s.dmt" % base,
-                           mime="application/octet-stream")
+        st.download_button("Download .dmt", data=out, file_name="%s.dmt" % base, mime="application/octet-stream")
 else:
     st.info("Upload a .kmz to begin.")
