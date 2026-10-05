@@ -391,17 +391,25 @@ def parse_kmz(path_or_bytes):
     except ET.ParseError:
         root = ET.fromstring(_repair_namespaces(text))
 
-    # style id -> (icon file, color)
+    # style id -> (icon file, icon color, line color).  Kept separate because a
+    # style may carry both a (often transparent) IconStyle colour and a real
+    # LineStyle colour; a line must use its LineStyle colour.
+    def _icon_file(el):
+        h = el.find('.//k:Icon/k:href', KNS)
+        return h.text.split('/')[-1] if h is not None and h.text else None
+
+    def _colors(el):
+        ic = el.find('.//k:IconStyle/k:color', KNS)
+        lc = el.find('.//k:LineStyle/k:color', KNS)
+        anyc = el.find('.//k:color', KNS)
+        icon_c = ic.text if ic is not None else (anyc.text if anyc is not None else None)
+        return icon_c, (lc.text if lc is not None else None)
+
     styles = {}
     for s in root.iter():
         if _ln(s) == 'Style':
-            sid = s.get('id')
-            href = s.find('.//k:Icon/k:href', KNS)
-            color = s.find('.//k:color', KNS)
-            styles[sid] = (
-                href.text.split('/')[-1] if href is not None and href.text else None,
-                color.text if color is not None else None,
-            )
+            ic, lc = _colors(s)
+            styles[s.get('id')] = (_icon_file(s), ic, lc)
     # StyleMap id -> its 'normal' style id (many exports reference points through
     # a StyleMap normal/highlight pair rather than a Style directly).
     stylemaps = {}
@@ -423,10 +431,8 @@ def parse_kmz(path_or_bytes):
             ref = stylemaps.get(ref, ref)          # follow StyleMap -> normal
             if ref in styles:
                 return styles[ref]
-        href = pm.find('.//k:Icon/k:href', KNS)
-        color = pm.find('.//k:color', KNS)
-        return (href.text.split('/')[-1] if href is not None and href.text else None,
-                color.text if color is not None else None)
+        ic, lc = _colors(pm)
+        return (_icon_file(pm), ic, lc)
 
     # Map a container's name to one of the four canonical layers.  Handles the
     # standard export (AGMs/Access/Centerline/Notes folders with direct
@@ -456,17 +462,17 @@ def parse_kmz(path_or_bytes):
                 t = _ln(child)
                 if t == 'Placemark':
                     pname = _text(child, 'k:name')
-                    icon, color = style_of(child)
+                    icon, icon_color, line_color = style_of(child)
                     # A placemark may hold multiple geometries (MultiGeometry:
                     # e.g. a Centerline line bundled with a label Point).  Emit
                     # every LineString and Point so nothing is silently dropped;
                     # the layer builder keeps only the kind it needs.
                     for lsc in child.findall('.//k:LineString/k:coordinates', KNS):
                         if lsc.text:
-                            items.append(Placemark(pname, 'line', _coords(lsc.text), icon, color, group))
+                            items.append(Placemark(pname, 'line', _coords(lsc.text), icon, line_color, group))
                     for ptc in child.findall('.//k:Point/k:coordinates', KNS):
                         if ptc.text:
-                            items.append(Placemark(pname, 'point', _coords(ptc.text), icon, color, group))
+                            items.append(Placemark(pname, 'point', _coords(ptc.text), icon, icon_color, group))
                 elif t in ('Folder', 'Document'):
                     sub = _text(child, 'k:name') or ''
                     low = sub.lower()
@@ -1375,7 +1381,7 @@ def _map_state(template, coords):
     span = max(max(lons) - min(lons), max(lats) - min(lats), 1e-4)
     # Calibrated from known DeLorme workspaces; 0.4 margin biases slightly wide
     # so no AGM sits off-screen.  effective zoom = level + log2(fine-multiplier).
-    eff = 6.64 - 1.53 * math.log2(span) - 0.4
+    eff = 6.64 - 1.53 * math.log2(span) - 0.2
     eff = max(2.0, min(15.0, eff))
     level = int(math.floor(eff))
     mult = 2.0 ** (eff - level)              # in [1, 2)
